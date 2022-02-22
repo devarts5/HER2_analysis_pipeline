@@ -1,0 +1,403 @@
+---
+title: "Tempus_HER2_Coding_Challenge"
+author: "David Evarts"
+date: "11/29/2021"
+output: pdf_document
+---
+
+# Goal
+The goal of this challenge is to analyze HER2 in TCGA breast cancer data and to understand how next generation sequencing could impact HER2 positive patient identification. 
+
+### The assignment is to:
+* QC and normalize the dataset.  
+* Identify HER2 positive patients determined clinically
+* Cluster the cancer RNA data.  Identify interesting clusters.
+* Analyze correlation of RNA, copy number and clinical status and determine if RNA or DNA is more predictive of clinical status.
+* Look for other interesting comparisons
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,message=FALSE,warning=FALSE,error = FALSE)
+
+#package install as needed
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+if(!require(DESeq2)) BiocManager::install("DESeq2")
+if(!require(RColorBrewer)) install.packages("RColorBrewer", repos = "http://cran.us.r-project.org")
+install.packages("assertive")
+
+#Libraries Used
+library(tidyselect)
+library(M3C)
+library(vsn)
+library(pheatmap)
+library(RColorBrewer)
+library(janitor)
+library(rlang)
+library(tidyr)
+library(data.table)
+library(ggplot2)
+library(dplyr)
+library(DESeq2)
+library(blockmodeling)
+library(digest)
+library(tidyverse)
+library(stringr)
+library(kableExtra)
+library(assertive)
+
+setwd("C:/Users/david/OneDrive/Documents/coding challenges/tempus_translational_science_coding_challenge/tempus_translational_science_coding_challenge")
+```
+
+### The data sets
+* $brca_tcga-clinical_data.csv$
+The identifiers in this data set are the found in the Patient.ID and Sample.ID columns. There are 1086 sample IDs from 1087 patients in the clinical data. Also of interest are the ER.Status.By.IHC and ER.Status.IHC.Percent.Positive columns, which give HER2 positive by immunohostochemistry test and the HER2.fish.status column which gives HER2 positive status by the more conclusive FISH (flourescence In Situ Hybridization) test. 
+
+* $brca_tcga_erbb2_copy_number.csv$ 
+These are copy numbers for the HER2/ERBB2 gene.(Cancer Genome Atlas Network^1^)  This is apparently from DNA array testing. The copy_number data includes 963 samples. 
+
+
+* $tcga.brca.rsem.csv$ 
+This is a counts file, using the RSEM (RNA-Seq by Expectation Maximization) algorithm for quantification of RNAseq data with or without a reference genome.^1^ The transcripts are already quantified.  Their are two identifiers, patient_id and bcr patient bar code. There are 1212 bar codes from 1093 patients in the RSEM_count. The bcr patient bar codes, are unique samples, i.e. multiple samples (i.e. different tissues). 112 of these are from adjacent normal tissue.  7 are from metastatic cells or tissues and 1093 are from primary tumors. must have been taken from the same patients.  The bcr patient bar code identifiers denote samples in the Cancer Genome Atlas(TCGA) Biospecimen Core Resource (BCR).  They match the Sample IDs in the clinical data.  
+
+```{r load_in_and_inspect}
+
+copy_number <- read.table("brca_tcga_erbb2_copy_number.csv",sep=",",header = TRUE, fill = TRUE)
+clinical_data <-read.table("brca_tcga_clinical_data.csv",sep = ",",header = TRUE, fill = TRUE)
+RSEM_counts <- read.table("tcga.brca.rsem.csv",sep = ",",header = TRUE, stringsAsFactors=FALSE,fill = TRUE)
+
+#RSEM_counts contains duplicate patient i.d.s., bcr_patient_bar_codes are unique samples, i.e. multiple samples (i.e. different tissues or cells) must have been taken from the same patients.
+# duplicates_bcr_patient_barcode <-  duplicated(RSEM_counts$bcr_patient_barcode)
+# which_duplicated_bcr <- any(duplicates_bcr_patient_barcode == TRUE)
+# duplicates_patient_id <-  duplicated(RSEM_counts$patient_id)
+# which_duplicated_id <- any(duplicates_patient_id == TRUE)
+
+#Note - As I do not have the RSEM results file, I am unable to use Tximport() to import. This will require some additional manipulation of the RSEM_counts data set before any analysis.
+
+```
+
+##Assumptions
+* The documentation for RSEM states that it does not require a reference genome and that in combination with a de novo transcriptome assembler, RSEM enables accurate transcript quantification for species without sequenced genomes.^1^  I do not have the Fasta and BAM files, The RSEM results file or information on how these counts were assembled. Thus, I cannot use tools such as FastQC to quality check for GC content, fragment length and such and will need to assume that much of the QC was previously completed in the RSEM package.  
+* As I do not have the full RSEM results file.  Thus I am assuming that the tcga.brca.rsem.csv file contains the expected count values.  (5th column of the $*.[genes|isoforms].results$ file).  
+
+* The documentation for RSEM also notes that RSEM provides "accurate gene-level abundance estimates [that are] are best obtained with large numbers of short single-end reads."^1^  I will assume that these are gene-level counts from single-end reads.
+
+*  I must assume that QC of raw read data has already been done.  This would include NA quality, number of samples being pooled on a single lane read nucleotide distribution, GC content, adapter sequence trimming and K-mer quality.  If I were to have done the alignment, I probably would have used FastQC in addition to the tools built into the alignment algorithm and the sequencer. If these these are RSEM expected counts, they should already be normalized within sample. I'll normalize for sequencing depth.
+
+
+```{r show_explore_data_sets}
+
+#Display dataset samples
+clinic_lite <- head(clinical_data[ 1:5,1:6])
+kable(clinic_lite,caption="Table 1: Sample of brca_tcga_clinical_data",align= c('l','l','l','l','l','l'))
+RSEM_counts_lite <- head(RSEM_counts[1:5,1:6])
+kable(clinic_lite,caption="Table 2: Sample of tcga.brca.rsem.csv",align= c('l','l','l','l','l','l'))
+copy_num_lite <- head(copy_number[,1:3])
+kable(copy_num_lite,caption="Table 3: Sample of brca_tcga_erbb2_copy_number",align= c('l','l','r'))
+
+#Tumor type exploration - Conclusion, there are three tumor types represented in the counts file.
+# Adjacent_Normal_num <- sum(RSEM_counts$sample_type == "Adjacent Normal")
+# Metastasis_num <- sum(RSEM_counts$sample_type == "Metastasis")
+# Primary_Tumor_num <- sum(RSEM_counts$sample_type == "Primary Tumor")
+# total_tumor_types <- Adjacent_Normal_num + Metastasis_num + Primary_Tumor_num
+
+```
+
+I'll combine the RSEM RNASeq counts data and the clinical data to use in further study.
+```{r combine_clinical_data_RSEM_Counts}
+
+#Cut clinical_data down to needed columns
+limited_clinical <- clinical_data%>%select(Sample.ID,Patient.ID,ER.Status.By.IHC,ER.Status.IHC.Percent.Positive,HER2.fish.status)
+
+#Make new RSEM_counts column with bcr_patient_code parts for vial,portion,analyte,plate and center removed, so that it will match clinical_data Patient.ID column.  Named Sample.ID to match column from clinical_data
+split <- str_split_fixed(RSEM_counts$bcr_patient_barcode,"-",n=7)
+split <- as_data_frame(split)
+colnames(split)<-  c("A","B","C","D","E","F","G")
+split <-split%>%select(A:D)
+split_D <- str_split_fixed(split$D,"",n=4)
+split_D <- as_data_frame(split_D)
+colnames(split_D)<-  c("A","B","C","D")
+split_D <-split_D%>%select(A:B)
+collapse_D <- paste(split_D$A,split_D$B, sep="")
+collapse_D <- unlist(collapse_D)
+split$E <- collapse_D
+split <- split%>%select(-"D")
+Patient_ID_RSEM <- paste(split$A,split$B,split$C,split$E,sep="-")
+RSEM_counts$Sample.ID  <- Patient_ID_RSEM
+RSEM_counts <- RSEM_counts%>%select(Patient.ID = patient_id, Sample.ID,everything(vars = NULL))%>%select(-bcr_patient_barcode)
+
+#Join ER.Status.By.IHC from clinical data to RSEM Counts
+RSEM_Counts_Plus_HER_Status <- left_join(RSEM_counts,limited_clinical, by = "Sample.ID")
+#arrange columns
+RSEM_Counts_Plus_HER_Status <- RSEM_Counts_Plus_HER_Status%>%select(Patient.ID = Patient.ID.x,everything(vars = NULL))%>%select(-Patient.ID.y)%>%relocate(ER.Status.By.IHC, .after = sample_type)%>%relocate(HER2.fish.status, .after = ER.Status.By.IHC)%>%relocate(ER.Status.IHC.Percent.Positive, .after = ER.Status.By.IHC)
+
+#Display
+RSEM_counts_Plus_HER_Statuslite <- head(RSEM_counts[1:5,1:6])
+kable(RSEM_counts_Plus_HER_Statuslite,caption="Table 4: Sample combined clincal & RNASeq data",align= c('l','l','l','l','l','l'))
+```
+
+```{r create_DESeq_objects}
+#For use  for non-dge based analysis.
+
+#remove extra identifiers
+counts <- RSEM_counts%>%select(-Patient.ID,-sample_type)
+#Turn sample i.d. column into row names
+counts<- counts%>%  remove_rownames() %>% column_to_rownames(var = "Sample.ID")
+# The genes are the columns and the samples are the rows. Transpose
+counts <- t(counts)
+#In order to follow RSEM with DESeq2, the counts either need imported via tximport (which requires the full RSEM output, rather than just expected counts, or the counts need to be rounded.  According to Mike Love, the writer of DESeq2, the latter is suboptimal, as tximport leverages the effective length information and isoform abundance estimates, but it should provide comparable conservative results.)
+counts <- counts%>%floor()
+
+#Create metadata table.  This can also be used for non-dge based analysis and easily transformed to DESeq2 objects.
+metadata <- RSEM_Counts_Plus_HER_Status%>% select(Patient.ID,Sample.ID,sample_type,ER.Status.By.IHC,HER2.fish.status)
+
+# Create DESeqData set. This can be used for normalization, QC, non-dge analysis and dge.  I'll use design=~ 1 here for count normalization and change it up as approprite after QC.
+DESeq_Data_Object <- DESeqDataSetFromMatrix(countData = counts, colData = metadata, design=~ Patient.ID , tidy = FALSE)
+```
+
+## Normalization of Counts
+Assuming that the counts provided are RSEM expected count values, there are a number of different approaches that can be used to normalize the count data.  Approaches that require a knowledge of the number of fragments sequenced are unavailable to me for this project.  One could simply adjust each samples expression estimates by the total number of reads reported in that sample.  This approach would be sensitive to outliers, which could unduly influence the total read count.  RSEM has RNASeq analysis package for differential expression, EBSeq^3^ that utilized the median of ratios method of normalization approach also found in DESeq.  It adjusts the expression measurements, so that the medians of the different samples distributions of expression line up. The calculation for the median ratio method is $sˆj=medianikij(∏mv=1kiv)1/m$ found in Anders and Huber^4^. The EBSeq version requires both transcripts and lanes for normalization.^4^  The median of ratios method makes the assumption that not ALL genes are differentially expressed; therefore, the normalization factors should account for sequencing depth and RNA composition of the sample (large outlier genes will not represent the median ratio values).This method is robust to imbalance in up-/down-regulation and large numbers of differentially expressed genes.^5^  As I only have the counts data (samples by genes), I use the DESeq2 version of this same median of ratios method.^6^
+
+
+```{r, count_norm}
+
+#Calculate normalized counts
+DESeq_Data_Object <- estimateSizeFactors(DESeq_Data_Object)
+#Extract normalized counts
+normalized_counts <- counts(DESeq_Data_Object, normalized=TRUE)
+normalized_counts <- as.data.frame(normalized_counts)
+#display
+print(head(normalized_counts[1:5,1:5]))
+
+#replace RSEM counts with normalized counts
+
+#Create new data set with normalized counts
+normalized_counts <-  t(normalized_counts)
+normalized_counts <- as.data.frame(normalized_counts)
+normalized_counts$Sample.ID <- RSEM_Counts_Plus_HER_Status$Sample.ID
+RSEM_Counts_Plus_HER_Norm <- RSEM_Counts_Plus_HER_Status%>%select(Patient.ID,Sample.ID,ER.Status.By.IHC,ER.Status.IHC.Percent.Positive,HER2.fish.status)
+RSEM_Counts_Plus_HER_Norm <- right_join(x = RSEM_Counts_Plus_HER_Norm,y = normalized_counts,by="Sample.ID")
+
+```
+
+##QC of RNASeq via Unsuprevised Clustering Analysis.
+As I have been given counts without upstream data, I must assume that QC for read quality, alignment, trimming, adapter removal and such have already been done. Normalization will have corrected for library depth and gene length. We can QC for differences between samples. If gene expression differences exist among experimental conditions, it should be expected that biological replicates of the same condition will cluster together in clustering analysis. 
+
+
+```{r QC_RNASeq_unsup_cluster_analysis}
+
+#A logarithmic transform of the normalized counts data will allow clearer visualization.  I'll use variance stabilizing transformations.
+
+vst_ddataset <- vst(DESeq_Data_Object,blind = TRUE)
+
+#get vst matrix
+vst_mat_DD_Object <- assay(vst_ddataset)
+
+##PCAs for QC and correlation visualization.
+pca_sample_type <- plotPCA(vst_ddataset, intgroup="sample_type")
+pca_IHC <-plotPCA(vst_ddataset, intgroup ="ER.Status.By.IHC")
+pca_fish <-plotPCA(vst_ddataset,intgroup = "HER2.fish.status")
+
+#compute pair-wise correlation values
+vst_cor_DD_Object <- cor(vst_mat_DD_Object)
+
+
+```
+
+### Further data clean-up based on PCA QC and resulting PCA and corelationships.
+```{r further_explore_QC}
+
+#filter data to remove gene where there are less than three samples with normalized counts greater than or equal to 5.  At a normalized count of 5, we can expect little expressed protein.
+idx <- rowSums(counts(DESeq_Data_Object, normalized=TRUE) >= 10 ) >= 5
+normalized_filtered_counts <- DESeq_Data_Object[idx,]
+
+##rerun PCA to check results of filtering
+
+#A logarithmic transform of the normalized counts data will allow clearer visualization.  I'll use variance stabilizing transformations.
+vst_ddataset <- vst(normalized_filtered_counts,blind = TRUE)
+#get vst matrix
+vst_mat_DD_Object <- assay(vst_ddataset)
+
+##PCAs for QC and correlation visualization.
+sample_type_pca <- plotPCA(vst_ddataset, intgroup="sample_type")
+IHC_pca <-plotPCA(vst_ddataset, intgroup ="ER.Status.By.IHC")
+FISH_pca <-plotPCA(vst_ddataset,intgroup = "HER2.fish.status")
+sample_type_pca
+
+#compute pair-wise correlation values
+vst_cor_DD_Object <- cor(vst_mat_DD_Object)
+```
+Additional filtering lowered the variances for the PCA plots, but did not result in clear differentiation.
+
+## Identify HER2+ Patients
+```{r identify_HER2+ patients,fig.cap= "Sample of data matrix of HER2+ Patients"}
+
+# number of identifiers for ER.Status.By.IHC in RSEM_Counts_Plus_HER_Status
+#RSEM_Count_Plus_HER_STATUS$HER2_pos_by_IHC <- Nan
+print("Number of each test result report type for IHC test for HER2+ breast cancer")
+table(RSEM_Counts_Plus_HER_Status['ER.Status.By.IHC'],useNA = "ifany")
+
+# limit data table to items listed as HER2+ by IHC
+HER2_pos_by_IHC <- RSEM_Counts_Plus_HER_Status%>% filter(ER.Status.By.IHC == "Positive")
+
+# limit data table to items listed as HER2+ by FISH
+HER2_pos_by_FISH <- RSEM_Counts_Plus_HER_Status%>% filter(HER2.fish.status == "Positive")
+
+HER2_Pos_Counts <- full_join(x=HER2_pos_by_IHC,y=HER2_pos_by_FISH)
+print(head(HER2_Pos_Counts)[,1:7])
+
+Her2_patients <- HER2_Pos_Counts%>%select(Patient.ID)%>%distinct()%>%count()
+HER2_patients_by_FISH <- HER2_pos_by_FISH%>%select(Patient.ID)%>%distinct()%>%count()
+HER2_patients_by_IHC <- HER2_pos_by_IHC%>%select(Patient.ID)%>%distinct()%>%count()
+```
+Identifying the patients listed as HER2+ by either IHC, FISH or both was done by sub-setting the data.   802 were identified as HER2+ by IHC, FISH,or both. 78 were identified by FISH. 790 were identified by IHC.
+
+##Correlations between clinical HER2 status, RNASeq ERBB2 gene counts and DNA ERBB2 copy number estimates.
+```{r corr_RNA_Clinical_Status}
+
+#Filtering with assumption that each cell should have at least three expressed genes counted at least 5 times
+idx2 <- rowSums(RSEM_Counts_Plus_HER_Norm  >= 5) >= 3
+filtered_RSEM_Counts_Plus_HER_Status <- RSEM_Counts_Plus_HER_Norm[idx2,]
+
+##Datasets for these tests
+
+#Data set for ERBB2 only, remove NA and Indeterminate IHC tests
+counts_plus_HER_just_ERB <- filtered_RSEM_Counts_Plus_HER_Status%>%select(1:6,ERBB2)%>%na.omit()
+
+#Data set for IHC vs RNA only
+counts_plus_IHC_only <- counts_plus_HER_just_ERB%>%filter(ER.Status.By.IHC != "Indeterminate")%>%drop_na(ER.Status.By.IHC)%>%select(- HER2.fish.status)
+
+#Data set for FISH vs RNA only
+counts_plus_FISH_only <- counts_plus_HER_just_ERB%>%select(- ER.Status.By.IHC )%>%drop_na(HER2.fish.status)
+
+#Data set for copy number vs RNA
+copy_number <- copy_number%>%select(Patient.ID = patient_id,Sample.ID = sample_id,erbb2_copy_number)
+counts_plus_HER_just_ERB_copy_number <- left_join(x = counts_plus_HER_just_ERB, y = copy_number)
+counts_plus_HER_just_ERB_copy_number <- as.data.frame(counts_plus_HER_just_ERB_copy_number)
+counts_plus_HER_just_ERB_copy_number <- counts_plus_HER_just_ERB_copy_number%>%drop_na(erbb2_copy_number)
+
+#Dataset for copy number vs FISH
+copy_number_FISH <- counts_plus_HER_just_ERB_copy_number%>%select(-ER.Status.By.IHC)%>%drop_na(HER2.fish.status)
+
+#Dataset for copy number vs IHC
+copy_number_IHC <- counts_plus_HER_just_ERB_copy_number%>%select(-HER2.fish.status)%>%drop_na(ER.Status.By.IHC)
+
+
+##correlation for IHC & RNASeq ERBB2
+
+#lm for ERRB2 quantity based on IHC
+modelERBB2_IHC <- lm(counts_plus_IHC_only$ERBB2~counts_plus_IHC_only$ER.Status.By.IHC)
+summary_ERBB2_IHC_regress <- summary(modelERBB2_IHC)
+print(summary_ERBB2_IHC_regress)
+
+#Box Plot Correlation ERBB2 counts versus IHC HER2 status, log for clearer visualization
+ggplot() + aes(x=counts_plus_IHC_only$ER.Status.By.IHC,y=log(counts_plus_IHC_only$ERBB2))+ geom_boxplot()+ggtitle("ERBB2/HER2 Expression and IHC determination of HER2 Status")+ xlab("HER2 Status by IHC")+ylab("ERRB2 Expression by RNASeq")
+
+#Check correlation of the level of ERRB2 expression with the HER STATUS by FISH
+
+#lm for ERRB2 quantity based on FISH
+modelERBB2_FISH <- lm(counts_plus_FISH_only$ERBB2~counts_plus_FISH_only$HER2.fish.status)
+summary_ERBB2_FISH_regress <- summary(modelERBB2_IHC)
+print(summary_ERBB2_IHC_regress)
+
+#Box Plot Correlation ERBB2 counts versus FISH HER2 status, log for clearer visualization
+ggplot() + aes(x=counts_plus_FISH_only$HER2.fish.status,y=log(counts_plus_FISH_only$ERBB2))+ geom_boxplot()+ggtitle("ERBB2/HER2 Expression and FISH determination of HER2 Status")+ xlab("HER2 Status by FISH")+ylab("ERRB2 Expression by RNASeq")
+
+#correlation RNA ERBB2 count and DNA ERBB2 copy number
+
+#lm for ERRB2 quantity based on copy number
+modelERBB2_countDNA <- lm(counts_plus_HER_just_ERB_copy_number$ERBB2~counts_plus_HER_just_ERB_copy_number$erbb2_copy_number)
+summary_ERBB2_IHC_regress <- summary(modelERBB2_countDNA)
+print(summary_ERBB2_IHC_regress)
+
+#Box Plot Correlation ERBB2 counts versus copy_number, log for clearer visualization
+ggplot() + aes(x=as.character(counts_plus_HER_just_ERB_copy_number$erbb2_copy_number),y=log(counts_plus_HER_just_ERB_copy_number$ERBB2))+ geom_boxplot()+ggtitle("ERBB2/HER2 Expression and DNA copy number")+ xlab("ERRB2 DNA copy number")+ylab("ERRB2 Expression by RNASeq")
+
+##Corelation of DNA copy number and IHC diagnosis
+
+#lm for copy number versus IHC descriptors
+model_IHC_clinical_copy_number <- lm(copy_number_IHC$erbb2_copy_number~copy_number_IHC$ER.Status.By.IHC)
+summary_copy_number_IHC_regress <- summary(model_IHC_clinical_copy_number)
+print(summary_copy_number_IHC_regress)
+
+#Box Plot Correlation  copy_number vs IHC Description, log for clearer visualization
+ggplot() + aes(x=copy_number_IHC$ER.Status.By.IHC, copy_number_IHC$erbb2_copy_number)+ geom_boxplot()+ggtitle("ERBB2 DNA copy number and IHC status")+ xlab("IHC Clincal Status")+ylab("ERRB2 DNA Copy Number")                                                                                                                                                                                                                                     
+
+#lm for copy number versus FISH descriptors
+model_FISH_clinical_copy_number <- lm(copy_number_FISH$erbb2_copy_number~copy_number_FISH$HER2.fish.status)
+summary_copy_number_FISH_regress <- summary(model_FISH_clinical_copy_number)
+print(summary_copy_number_FISH_regress)
+
+#Box Plot Correlation  copy_number vs FISH Description, log for clearer visualization
+ggplot() + aes(x=copy_number_FISH$HER2.fish.status,y=copy_number_FISH$erbb2_copy_number)+ geom_boxplot()+ggtitle("ERBB2 DNA copy number and FISH Status")+ xlab("FISH Clincal Status")+ylab("ERBB2 DNA Copy Number")                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                          
+```
+###Discussion of Correlation test results.
+I ran simple linear models to determine correlation and generated box plots to compare correlations between clinical status by IHC and count numbers by DNA assay, clinical status by IHC and RNASeq measurement of expression of the ERBB2 gene, clinical status by FISH and count numbers, clinical status by FISH and  RNASeq ERBB2 expression.  
+ 	The p-value for the test of ERBB2 RNA versus IHC HER status could not exclude the null hypothesis that the two are uncorrelated with a p-value of 0.23(rounded).  The box plot interquartile boxes and median values of these two overlapped.  It is not clear that RNASeq expression of ERBB2 and clinical HER2+ status are correlated by this data.
+ 	
+ 	 The RNA expression level versus FISH based HER status test did exclude the null hypothesis with a p-value of 2.2e-16.  The boxplot shows a clear separation between the negative and positive quantile boxes and their median values.  We can clearly say that FISH, generally regarded as a more accurate clinical diagnostic test and RNA expression levels for ERBB2 are correlated.
+ 	 
+	We do not have continuous copy numbers.  We have categorical values indicating whether deletions or extra copies were present.  This limits the sensitivity of a simple linear model or a box plot in comparing copy number to clinical data.
+	
+We cannot reject the null hypothesis that DNA copy number and IHC diagnosis are unrelated with a p-value of 0.27(rounded). DNA copy number simply does not correlate with IHC clinical positive diagnosis.  This is illustrated by the overlap of the two interquartile ranges in the boxplot.  However, we do not have continuous copy numbers.  We have categorical values indicating whether deletions or extra copies were present.  The medians of the boxplot meet at a normal diploid level.  More concerning for the correlation of the IHC clinical and DNA copy number data is that few of the positive IHC HER2 determinations enter the copy number level determined as over-expression. Thus, the boxplot may be misleading, and this limits the sensitivity of a simple linear model in comparing copy number to clinical data.
+
+ 	In the case of comparing correlation between FISH based diagnosis and DNA base copy number results, we can definitively rule out a null hypothesis that they are not related with a p-value of less than 2.2e-16.  However, as few negative FISH tests are reported, this may be limited.  Presumably the lack of negative FISH results is due to a limited number of patients having diagnosis by FISH unless they have already been determined to be HER2+ by IHC.
+ 	
+	The correlation between DNA copy number and ERBB2 RNA counts is clear. We can reject the null hypothesis that they are not correlate with a p-value of 7.969e-16 .  The boxplot demonstrates a clear separation between values for copy numbers of 2 and 1, 2 and 0 and 2 and -1.   Further, the values rise with ERBB2 RNASeq expression.  However, the values for 0 and 1 (indicating simply diploid and moderate amplification) are overlapping and the separation between diploid and deletions (0 and -1) is not clear.
+        
+## Determination of comparative value of HER2 clinical status prediction by RNASeq counts or estimated DNA count numbers.
+
+         Neither the DNA copy number, nor RNASeq count numbers are well correlated to the IHC counts. Both are correlated to the FISH counts and are correlated with each other, if limited to the over-expression and deep deletion categories.  However, the copy number descriptor for over-expression of ERBB2 (+2), which is the basis for HER2 status is outside of the interquartile range of the number of patients determined to be HER2 positive, by IHC.  Thus, the DNA based test is less capable of predicting clinical status by IHC, the most used clinical diagnostic.
+
+```{r differential_expression_limited_to_IHC_Tested}
+
+#create counts table without identifiers, limited without NAs 
+# Counts_DEG <- RSEM_Counts_Plus_HER_Status%>%na.omit()%>%remove_rownames() %>% column_to_rownames(var = "Sample.ID")%>% select(7:1212)%>%floor()%>%t()
+# 
+# # Create metadata table to match
+# meta <- RSEM_Counts_Plus_HER_Status%>%na.omit()%>%select(Sample.ID,Patient.ID,sample_type,ER.Status.By.IHC,HER2.fish.status)
+# 
+# #Create DGE object
+# DESeq_Data_Set <- DESeqDataSetFromMatrix(countData = Counts_DEG, colData = meta, design= ~  ER.Status.By.IHC , tidy = FALSE)
+# 
+# # Differential Expression Analysis
+# Dif_Exp <- DESeq(DESeq_Data_Set)
+```
+
+```{r DGE_Results,fig.cap= "Results Table of Significantly Differnentially Expressed Genes"}
+# #The  factors listed for the contrast are contrast <- c("condition", "level_to_compare", "base_level").  The base level is used to interpret the log2 fold change.  I.E. A log fold change of 2 would mean the gene espression is higher in factor level than the base level.  A fold change of -2 would mean it is lower in factor level relative ot the base level. 
+#  resultsNames(Dif_Exp)
+#  contrast <- list(resultsNames(Dif_Exp)[1],resultsNames(Dif_Exp)[2])
+# results_table_DGE <- results(Dif_Exp,contrast = contrast)
+# #Get info on columns in results
+# mcols(results_table_DGE, use.names = TRUE)
+# #summarize results
+# DGE_summary_table <- summary(results_table_DGE, alpha = 0.05)
+# #set threshold
+# padj.cutoff <- 0.05
+# #Make results tibble
+# results_table_DGE <- results_table_DGE%>%data.frame()%>%rownames_to_column(var="gene")%>%as_tibble()
+# #limit to sig. dif. expr. genes
+# sig_dge_genes <- results_table_DGE%>%filter(padj < padj.cutoff)
+# sig_dge_genes
+# top_20 <- sig_dge_genes%>%arrange(desc(log2FoldChange))
+```
+
+# References
+
+1. Li, B., Dewey, C.N. RSEM: accurate transcript quantification from RNA-Seq data with or without a reference genome. BMC Bioinformatics 12, 323 (2011). 
+
+2. The Cancer Genome Atlas Network. Comprehensive molecular portraits of human breast tumours. Nature 490, 61–70 (2012).
+
+3.Leng N, Kendziorski C (2021). EBSeq: An R package for gene and isoform differential expression analysis of RNA-seq data. R package version 1.34.0.
+
+4. Simon Anders, Wolfgang Huber: Differential expression analysis for sequence count data. Genome Biology 2010, 11:106. 
+
+5. A. Stupnikov, C.E. McInerney, K.I. Savage, S.A. McIntosh, F. Emmert-Streib, R. Kennedy, M. Salto-Tellez, K.M. Prise, D.G. McArt,
+Robustness of differential gene expression analysis of RNA-seq,
+Computational and Structural Biotechnology Journal,
+Volume 19, 2021, Pages 3470-3481
+
+6. Love MI, Huber W, Anders S (2014). “Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2.” Genome Biology, 15, 550. doi: 10.1186/s13059-014-0550-8.
+
+
